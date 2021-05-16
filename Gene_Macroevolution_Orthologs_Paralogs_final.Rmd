@@ -1,0 +1,1694 @@
+---
+title: "Macroevolutionary analyses of snake transcripts with a focus on toxin evolution"
+output: html_document
+---
+
+This document will follow the analyses of transcriptome data for 11 species of Bothriechis following the method of Dunn & et al. 2018, Pairwise comparisons across species are problematic when analyzing functional genomic data. Much of the code and functions that I use were modified from their original analyses. I highly recommend reading their paper for conceptual background of the comparative method.
+
+First purge environment, otherwise errors can occur. Use ctrl+shift+f10 in R studio.
+```{r}
+library( treeio ) # devtools::install_github("GuangchuangYu/treeio")
+library( ggtree ) # devtools::install_github("GuangchuangYu/ggtree")
+library( hutan ) # devtools::install_github("caseywdunn/hutan")
+
+
+library( ape )
+library( digest )
+library( geiger )
+library( ggrepel )
+library( gridExtra )
+library( magrittr )
+library( foreach )
+library( doParallel )
+library( phytools )
+library( stringr )
+library( tidyverse )
+library( caper )
+
+library(dplyr)
+
+
+# Set system computational parameters
+	cores = detectCores() - 1
+	if ( cores < 1 ) {
+		cores = 1
+	}
+
+	# Register parallel workers for %dopar%
+	registerDoParallel( cores )
+
+
+#' Parses nhx text to a treeio::treedata object
+#' 
+#' @param tree_text Character string repressenting nhx tree
+#' @return A treeio::treedata object
+#' @export
+
+
+
+## Dunn et al. code
+parse_gene_trees = function( tree_text ){
+	tree_tc = textConnection( tree_text )
+	tree = treeio::read.nhx( tree_tc )
+	close( tree_tc )
+	
+	# Parse clade labels from phylo object into the data frame
+	tree@data$label = c( tree@phylo$tip.label, tree@phylo$node.label )
+	
+	# Compara trees sometimes have speciation nodes whose descendants have the 
+	# same clade name. This isn't biologically possible, so change such nodes 
+	# from speciation events to NA so they don't interfere with tree calibration 
+	# and are not used for calculating speciation contrasts
+	
+	n_nodes = nrow( tree@data )
+	n_tips = length( tree@phylo$tip.label )
+	internal_nodes = ( n_tips + 1 ):n_nodes
+	is_speciation = tree@data$D == "N"
+	is_speciation[ is.na( is_speciation ) ] = FALSE
+	internal_speciation_nodes = tree@data$node[ ( tree@data$node > n_tips ) & is_speciation ]
+	
+	# Create a vector of clade names of speciation events, with NA for all other nodes
+	speciation_names = rep( NA, n_nodes )
+	speciation_names[ internal_speciation_nodes ] = tree@data$label[ internal_speciation_nodes ]
+	
+	# Loop over the internal speciation nodes
+	for( i in internal_speciation_nodes ){
+		# get descendent internal nodes
+		descendants = hutan::descendants( tree@phylo, i )
+		descendants = descendants[ descendants %in% internal_nodes ]
+		
+		descendant_names = speciation_names[ descendants ]
+		
+		if( speciation_names[i] %in% descendant_names ){
+			tree@data$D[i] = NA
+		}
+	}
+	
+	# Create a human readable Event column
+	tree@data$Event = NA
+	tree@data$Event[ tree@data$D == "N" ] = "Speciation"
+	tree@data$Event[ tree@data$D == "Y" ] = "Duplication"
+	tree@data$Event = factor( tree@data$Event, levels=c( "Speciation", "Duplication" ) )
+	
+	return( tree )
+}
+
+#' Get a boolean vector corresponding to all tips and internal nodes of 
+#' a tree, with value TRUE for tips and FALSE for internal nodes
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata object
+#' @return A boolean vector
+#' @export
+is.tip.nhx = function( nhx ) {
+	is.tip = rep( FALSE, nrow( nhx@data ) )
+	is.tip[ 1:length( nhx@phylo$tip.label ) ] = TRUE
+	is.tip
+}
+
+
+
+
+
+# AM: I made a minor modification to directly accept the nhx tree instead of text which is then parsed as a tree
+parse_generax_trees = function( tree_text ){
+	tree_tc = textConnection( tree_text )
+	tree = treeio::read.nhx( tree_tc )
+	close( tree_tc )
+	
+	# Parse clade labels from phylo object into the data frame
+	tree@data$clade_label = c( tree@phylo$tip.label, tree@data$S[(length(tree@phylo$tip.label)+1):length(tree@data$S)] )
+	
+	# Compara trees sometimes have speciation nodes whose descendants have the 
+	# same clade name. This isn't biologically possible, so change such nodes 
+	# from speciation events to NA so they don't interfere with tree calibration 
+	# and are not used for calculating speciation contrasts
+	
+	n_nodes = nrow( tree@data )
+	n_tips = length( tree@phylo$tip.label )
+	internal_nodes = ( n_tips + 1 ):n_nodes
+	is_speciation = tree@data$D == "N"
+	is_speciation[ is.na( is_speciation ) ] = FALSE
+	internal_speciation_nodes = tree@data$node[ ( tree@data$node > n_tips ) & is_speciation ]
+	
+	# Create a vector of clade names of speciation events, with NA for all other nodes
+	speciation_names = rep( NA, n_nodes )
+	speciation_names[ internal_speciation_nodes ] = tree@data$clade_label[ internal_speciation_nodes ]
+	
+	# Loop over the internal speciation nodes
+	for( i in internal_speciation_nodes ){
+		# get descendent internal nodes
+		descendants = hutan::descendants( tree@phylo, i )
+		descendants = descendants[ descendants %in% internal_nodes ]
+		
+		descendant_names = speciation_names[ descendants ]
+		
+		if( speciation_names[i] %in% descendant_names ){
+			tree@data$D[i] = NA
+		}
+	}
+	
+	
+	# Create a human readable Event column
+	tree@data$Event = NA
+	tree@data$Event[ tree@data$D == "N" ] = "Speciation"
+	tree@data$Event[ tree@data$D == "Y" ] = "Duplication"
+	tree@data$Event = factor( tree@data$Event, levels=c( "Speciation", "Duplication" ) )
+	
+	return( tree )
+}
+
+#' Get a boolean vector corresponding to all tips and internal nodes of 
+#' a tree, with value TRUE for tips and FALSE for internal nodes
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata object
+#' @return A boolean vector
+#' @export
+is.tip.nhx = function( nhx ) {
+	is.tip = rep( FALSE, nrow( nhx@data ) )
+	is.tip[ 1:length( nhx@phylo$tip.label ) ] = TRUE
+	is.tip
+}
+
+
+
+
+#' Drop tips without expression data from a tree. 
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata object, with a 
+#' column @data$Tau containing expression data
+#' @param min_genes_with_expression The minimum number of tips with 
+#' expression data for a tree to be retained
+#' @return A treeio::treedata object, or NA if less than 
+#' min_genes_with_expression
+#' @export
+drop_empty_tips = function( nhx, min_genes_with_expression ) {
+	
+	# Identify the tips without expression data
+	to_drop = which( is.na( nhx@data[ 1:length( nhx@phylo$tip.label ), ]$Ave_clrTPM ) )
+	
+	# Return the pruned tree if it meets sampling criteria, otherwise return NA
+	remaining = length( nhx@phylo$tip.label ) - length( to_drop )
+	if( remaining >= min_genes_with_expression ){
+		pruned = treeio::drop.tip( nhx, to_drop )
+		
+		node_depth = ape::node.depth( pruned@phylo )
+		
+		# Add node depth
+		pruned@data$node_depth = node_depth
+		
+		return( pruned )
+	}
+	else{
+		return( NA )
+	}
+}
+
+
+
+#' Record the distance from a tip for each node in a tree in 
+#' the data slot
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata
+#' @return A treeio::treedata object, with an additional node_age column
+#' in the data slot, or the original object if it was not of class treedata
+#' @export
+store_node_age = function( nhx ) {
+	
+	if ( class( nhx ) != "treedata" ) {
+		return( nhx )
+	}
+	
+	node_age = hutan::distance_from_tip( nhx@phylo )
+	
+	# make sure the dataframe is ordered by consecutive nodes
+	stopifnot( all( nhx@data$node == 1:length( nhx@data$node ) ) )
+	
+	nhx@data$node_age = node_age 
+	
+	return( nhx )
+}
+
+
+
+
+
+
+
+#' Adjust branch lengths of a phylogenetic tree to make it ultrametric and 
+#' to time calibrate the speciation nodes to fixed values
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata object, with speciation 
+#' nodes annotated with a value of "N" in @data$D
+#' @param calibration_times A dataframe with two columns: age is the age 
+#' of a clade, and clade is the name of the clade
+#' @param ... Any additional arguments to pass to ape::chronos()
+#' @return A treeio::treedata object if successfully calibrated
+#' @export
+
+calibrate_tree = function ( nhx, calibration_times, ... ) {
+	
+	# Create calibration matrix for speciation nodes
+	calibration = 
+		nhx@data[ !is.tip.nhx( nhx ), ] %>%
+		filter( D == "N" ) %>%
+	  filter( clade_label %in% calibration_times$clade ) %>%
+		left_join( calibration_times, c( "clade_label" = "clade" ) ) %>%
+		mutate( age.min = age ) %>%
+		mutate( age.max = age ) %>% 
+		select( node, age.min, age.max ) %>%
+		mutate( soft.bounds = NA )
+	
+	tree = try( 
+		ape::chronos( nhx@phylo, calibration=calibration, ... ) 
+	)
+	
+	if( "phylo" %in% class( tree ) ){
+		class( tree ) = "phylo"
+		nhx@phylo = tree
+		return( nhx )
+	}
+	else{
+		return( NA )
+	}
+}
+
+
+#' Calibrate a list of gene trees given a set of speciation node dates
+#' 
+#' @param gene_trees_pruned A list of phylogenetic trees as treeio::treedata objects 
+#' with associated character data
+#' @param calibration_times A dataframe with two columns: age.min is the age 
+#' of a clade, and clade is the name of the clade
+#' @param ... Any additional arguments to pass to ape::chronos()
+#' @return A list of calibrated phylogenetic trees as treeio::treedata objects. May be 
+#' shorter than gene_trees_pruned if some calibrations fail.
+#' @export
+calibrate_trees = function( gene_trees_pruned, calibration_times, ... ) {
+	# Make the trees ultrametric and calibrate the speciation nodes to 
+	# specified times	
+	gene_trees_calibrated = foreach( tree=gene_trees_pruned ) %dopar% 
+		calibrate_tree( tree, calibration_times=calibration_times, ... )
+
+	# Remove trees that could not be successfully calibrated
+	gene_trees_calibrated = gene_trees_calibrated[ ! is.na( gene_trees_calibrated ) ]
+	
+	# Parse the calibrated node ages from the internal @phylo object and store them with the 
+	# corresponding rows in the @data object
+	gene_trees_calibrated = foreach( tree=gene_trees_calibrated ) %dopar% 
+		store_node_age( tree )
+	
+	return( gene_trees_calibrated )
+}
+
+
+
+
+add_model_parameters = function( nhx, ... ) {
+	phy = nhx@phylo
+	tpm_original = nhx@data$Ave_clrTPM [ 1:length( phy$tip.label ) ]
+	names( tpm_original ) = phy$tip.label
+
+	# Set bounds on fitContinuous per manual, as unbond searches
+	# can get stuck. These bounds were selected according to 
+	# observed estimates on runs when no fitContinuous calls
+	# got stuck. Set ncores=1 so that can wrap in parallel 
+	# code without problems.
+
+	brownian_model = fitContinuous( 
+		phy, 
+		tpm_original, 
+		model="BM", 
+		#bounds=list(sigsq=c(0.0, 1.0)),
+		ncores=1,
+		... 
+	)
+	nhx@phylo$model_bm$opt = brownian_model$opt
+
+	ou_model = fitContinuous( 
+		phy, 
+		tpm_original, 
+		model="OU", 
+		#bounds=list(sigsq=c(0.0, 1.0), alpha=c(0.0, 3.0)),
+		ncores=1,
+		... 
+	)
+	nhx@phylo$model_ou$opt = ou_model$opt	
+	
+	return( nhx )
+}
+
+
+
+#' Calculate phylogenetic independent contrasts (PIC) with the tree and 
+#' character data in a treeio::treedata object
+#' 
+#' @param nhx A phylogenetic tree as a treeio::treedata object, with a 
+#' column @data$Ave_clrTPM containing expression data
+#' @param model_method The model of trait evolution. Can be one of c("BM", "OU")
+#' @return A treeio::treedata object, with new @data columns pic and var_exp
+#' @export
+pic.nhx = function( nhx, model_method="BM" ) {
+	
+	tpm = nhx@data$Ave_clrTPM[ is.tip.nhx( nhx ) ]
+	
+	if( any( is.na(tpm) ) ){
+		stop( "A trait value is NA." )
+	}
+	
+	# Calculate the contrasts
+	if ( model_method=="BM" ){
+		p = ape::pic( 
+			tpm, 
+			nhx@phylo, 
+			var.contrasts=TRUE 
+		)
+	} else if ( model_method=="OU" ){
+		p = hutan::picx( 
+			tpm, 
+			nhx@phylo, 
+			var.contrasts=TRUE , 
+			model_method="OU", 
+			model_parameters=nhx@phylo$model_ou
+		)
+	} else {
+		stop("ERROR: Invalid model_method")
+	}
+	
+	# Remove previous values if they exist
+	nhx@data$pic = NULL
+	nhx@data$var_exp = NULL
+
+	# Add the results back to the @data slot, padding the rows that correspond to 
+	# tips with NA
+	nhx@data$pic = c( rep( NA, length( nhx@phylo$tip.label ) ), p[ ,1 ] )
+	nhx@data$var_exp = c( rep( NA, length( nhx@phylo$tip.label ) ), p[ ,2 ] )
+	
+	return( nhx )
+}
+
+
+
+
+#' Add phylogenetic independent contrasts (PIC) with the tree and 
+#' character data in a treeio::treedata object
+#' 
+#' @param gene_trees_calibrated A list of time calibrated phylogenetic trees 
+#' as treeio::treedata objects 
+#' @param model_method The model of trait evolution. Can be one of c("BM", "OU")
+#' @return A list of time phylogenetic trees with pics 
+#' as treeio::treedata objects
+#' @export
+add_pics_to_trees = function( gene_trees_calibrated, model_method="BM" ) {
+	
+	# Calculate independent contrasts for tau on each tree, storing the results 
+	# back into the @data slot of the tree objects
+	gene_trees_pic = foreach( tree=gene_trees_calibrated ) %dopar% 
+		pic.nhx( tree, model_method=model_method )
+	
+	return( gene_trees_pic )
+}
+
+
+
+
+#' Add phylogenetic independent contrasts (PIC) with the tree and 
+#' character data in a treeio::treedata object
+#' 
+#' @param gene_trees_pic A list of phylogenetic trees with pics
+#' as treeio::treedata objects 
+#' @return A tibble with combined data, including phylogenetic independent 
+#' contrasts, for internal nodes of all trees
+#' @export
+summarize_contrasts = function( gene_trees_pic ) {
+	# Combine the @data slots across all trees. These have labels, node annotations,
+	# expression data, contrast results, etc...
+	# Also take the absolute value of the contrast, since we only consider magnitude.
+	nodes_all = 
+		lapply( 
+			gene_trees_pic, 
+			function( nhx ){
+				tags = nhx@data
+				tags$gene = digest( nhx ) # Creates a hash that is unique to each gene tree
+				tags %<>% select( -( B ) ) # B has inconsistent types, remove it
+				return( tags )
+			}
+		) %>%
+		bind_rows() %>%
+		mutate( pic = abs( pic ) )
+	
+	# Create a subset that corresponds to nodes with contrasts. This excludes tips.
+	nodes_contrast = 
+		nodes_all %>%
+		filter( ! is.na( pic ) ) %>%
+		filter( ! is.na( D ) )
+	
+	return( nodes_contrast )
+}
+
+
+
+
+
+#' Wilcoxon test of the ortholog conjecture, specifically that contrasts
+#' associated with duplication nodes are greater than those for 
+#' speciation nodes. A significant result indicates rejection of the null
+#' hypothesis that they are not greater.
+#' 
+#' @param nodes_contrast A tibble of independent contrasts
+#' @return Wilcoxon test p value
+#' @export
+wilcox_oc = function( nodes_contrast ) {
+	
+	p = wilcox.test( 
+		nodes_contrast %>% filter( D=="Y" ) %>% .$pic, 
+		nodes_contrast %>% filter( D=="N" ) %>% .$pic, 
+		alternative="greater" 
+	)$p.value
+	
+	return( p )
+}
+
+
+
+
+#' Prepare summary statistics for each tree
+#' 
+#' @param gene_trees A list of phylogenetic trees with pics
+#' as treeio::treedata objects 
+#' @return A tibble with combined data
+#' @export
+summarize_trees = function( gene_trees_pic ) {
+	
+	tree_summary = 
+		lapply( 
+			gene_trees_pic, 
+			function( nhx ){
+				tags = nhx@data
+				phy = nhx@phylo
+				x = nhx@data$Ave_clrTPM[1:length(phy$tip.label)]
+				names( x ) = phy$tip.label
+				if (length(unique(tags$Toxin_Nontoxin)) == 1){tn = unique(tags$Toxin_Nontoxin)[1]}
+				else{tn = NA}
+				if (length(unique(tags$Toxin_Class)) == 1){tc = unique(tags$Toxin_Class)[1]}
+				else{tc = NA}
+				
+				tree<-phy
+				tree$node.label=c()
+				tree_dat<-as.data.frame(tags[ is.tip.nhx( nhx ), ])
+				pgls_dat<-try( caper::comparative.data(tree,tree_dat,clade_label,vcv=TRUE,vcv.dim = 3, scope=Ave_clrTPM ~ 1) )
+				pgls_model<-try( caper::pgls(Ave_clrTPM ~ 1, pgls_dat, lambda = 'ML') )
+				if( "pgls" %in% class( pgls_model ) ){
+				  lambda_2 = pgls_model$param.CI$lambda$opt
+					lamda_lowerCI = pgls_model$param.CI$lambda$ci.val[1]
+					lamda_upperCI = pgls_model$param.CI$lambda$ci.val[2]}
+				else{
+				  lambda_2 = NA
+					lamda_lowerCI = NA
+					lamda_upperCI = NA}
+				  
+				
+				tibble(
+					gene = digest( nhx ),
+					Toxin_Nontoxin = tn,
+					Toxin_Class = tc,
+					n_tips = length( x ),
+					TPM_mean = mean( x ),
+					TPM_var = var( x ),
+					K = phytools::phylosig( phy, x, method="K" ),
+					K_p = phytools::phylosig( phy, x, method="K" ,test = TRUE)[[2]],
+					Lambda = phytools::phylosig( phy, x, method="lambda" )[[1]],
+					Lambda_p = phytools::phylosig( phy, x, method="lambda", test = TRUE)[[4]],
+					Lambda_2 = lambda_2,
+					Lamda_lowerCI = lamda_lowerCI,
+					Lamda_upperCI = lamda_upperCI,
+					z0_bm = nhx@phylo$model_bm$opt$z0,
+					z0_ou = nhx@phylo$model_ou$opt$z0,
+					sigsq_bm = nhx@phylo$model_bm$opt$sigsq,
+					sigsq_ou = nhx@phylo$model_ou$opt$sigsq,
+					alpha_ou = nhx@phylo$model_ou$opt$alpha,
+					aic_bm = nhx@phylo$model_bm$opt$aic,
+					aic_ou = nhx@phylo$model_ou$opt$aic,
+					lnL_bm = nhx@phylo$model_bm$opt$lnL,
+					lnL_ou = nhx@phylo$model_ou$opt$lnL
+				)
+			}
+		) %>%
+		bind_rows()
+	
+	return( tree_summary )
+}
+
+
+
+
+#' Summarize edge data and properties of a single tree
+#' 
+#' @param gene_trees A phylogenetic tree
+#' as treeio::treedata object
+#' @return A tibble with edge data
+summarize_nhx_edges = function( nhx ){
+	tags = nhx@data
+	phy = nhx@phylo
+	edge_length = phy$edge.length
+	
+	TPM_tips = nhx@data$Ave_clrTPM[1:length(phy$tip.label)]
+	TPM_internal = ace( TPM_tips, phy, method="pic" )$ace
+	TPM = c( TPM_tips, TPM_internal )
+	TPM_on_edges = sapply( phy$edge, function(x){ TPM[x] })
+	dim( TPM_on_edges ) = dim( phy$edge )
+	TPM_parent = TPM_on_edges[ , 1 ]
+	TPM_child = TPM_on_edges[ , 2 ]
+	
+	event_type = as.character( tags$Event )
+	event_type[1:length(phy$tip.label)] = "Tip"
+	events_on_edges = sapply( phy$edge, function(x){ event_type[x] })
+	dim( events_on_edges ) = dim( phy$edge )
+	
+	scaled_change = (TPM_child - TPM_parent) / edge_length
+	
+	if (length(unique(tags$Toxin_Nontoxin)) == 1){tn = unique(tags$Toxin_Nontoxin)[1]}
+				else{tn = NA}
+				if (length(unique(tags$Toxin_Class)) == 1){tc = unique(tags$Toxin_Class)[1]}
+				else{tc = NA}
+	
+	tibble(
+		gene = digest( nhx ),
+		Toxin_Nontoxin = tn,
+		Toxin_Class = tc,
+		edge_length = edge_length,
+		TPM_parent = TPM_parent,
+		TPM_child = TPM_child,
+		event_parent = events_on_edges[ , 1 ],
+		event_child = events_on_edges[ , 2 ],
+		scaled_change = scaled_change
+	)
+
+}
+
+#' Summarize edge data and properties of a single tree
+#' 
+#' @param gene_trees A list of phylogenetic trees 
+#' as treeio::treedata objects 
+#' @return A tibble with combined edge data
+#' @export
+summarize_edges = function( gene_trees ){
+
+	edge_summaries = foreach( tree=gene_trees ) %dopar% 
+		summarize_nhx_edges( tree )
+
+	return( edge_summaries %>% bind_rows() )
+
+}
+
+
+```
+
+
+
+
+Read in and plot species tree
+```{r}
+
+Bothri_species<-read.newick("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Bothri_dated_pruned.nwk")
+Bothri_species_1<-read.tree("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Bothri_dated_pruned.nwk")
+
+ggtree(Bothri_species) + geom_text(aes(label=18.0425-node.depth.edgelength(Bothri_species))) + theme_tree2() #18.042 because I knew that was the max height of the species tree
+
+```
+
+
+
+Read in prank aligned generax trees.
+```{r}
+setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+tree_lines = readLines("generax/prank/generax_prank_tree.nhx")
+generax_prank_trees<-foreach( tree_line=tree_lines ) %dopar%
+		parse_generax_trees( tree_line )
+```
+
+An important task that we need to accomplish is renaming nodes from trees that have been pruned such that all speciation nodes have the same labels. We will need this to be true to make sure the gene trees are calibrated appropriately.
+
+To do this, we can take advantage of the fact that all pruned species trees are derived from the same species tree. Thus, if we prune a pre-labeled full species tree in R, we should get a tree matching a reduced species tree with the proper node labels. We can compare this tree to the labeled species tree used by generax or tree rect to make a dictionary/map to relabel the nodes of the genetrees appropriately.
+This will also help us verify that our tree is calibrated right because we will know what each tree will look like.
+```{r}
+library(hash)
+
+relabel_gene_tree = function(full_labelled_species_tree, labelled_species_tree, nhx_tree){
+  prune_species = c()
+  #identify tips that need to be pruned
+  for (species in full_labelled_species_tree$tip.label){
+    if ((species %in% labelled_species_tree$tip.label)==FALSE){prune_species=c(prune_species,species)}
+  }
+  pruned_tree = drop.tip(full_labelled_species_tree,prune_species) #prune tree. Now we have a tree with appropriate node labels
+  h<-hash()
+  for (i in 1:length(pruned_tree$node.label)){
+    h[[labelled_species_tree$node.label[i]]]<-pruned_tree$node.label[i]
+  }
+  for (i in 1:length(nhx_tree@data$S)){
+    if (nhx_tree@data$S[i] %in% keys(h)){
+      nhx_tree@data$S[i]<-h[[nhx_tree@data$S[i]]]
+      nhx_tree@data$clade_label[i]<-h[[nhx_tree@data$clade_label[i]]]
+      }
+  }
+  return(nhx_tree)
+}
+```
+
+
+```{r}
+setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+#read in species trees
+generax_species_tree <- read.newick("generax/generax_full_labelled_species_tree.newick")
+
+
+#read in pruned species trees used in genetrees
+generax_prank_species_trees<- read.newick("generax/prank/generax_prank_labelled_species_trees.nwk")
+
+```
+
+Okay, now actually relabel the trees
+```{r}
+
+#generax_prank_trees
+tmp<-c()
+for(i in 1:length(generax_prank_trees)){
+ tree<-relabel_gene_tree(generax_species_tree, generax_prank_species_trees[[i]],generax_prank_trees[[i]])
+ tmp<-c(tmp,tree)
+}
+generax_prank_trees<-tmp
+
+
+```
+
+
+Now filter out trees with less than 9 species.
+First I'll write a function to determine the number of species in a tree and then remove those that have too few species
+```{r}
+#Function to filter of trees by the number of species represented
+filter_by_number_species = function(tree, min_species){
+  
+# make list of species in the tree by grepping for 'B' (as in 'B'othriechies)
+  species = c()
+  values = unique(tree@data$S)
+  for (i in values){
+    if (grepl('B', i)){species = c(species,i)}
+  }
+  
+  if (length(species) > min_species){return(tree)}
+  else {return( NA )}
+}
+```
+
+
+Run that function on each tree set to filter trees.
+Apparently the way I ran that function it also returned empty values in the list so I set up a for loop for each dataset to get rid of empty values (i.e. values with length < 1).
+```{r}
+
+min_species = 9
+
+
+generax_prank_trees_passfilter = foreach( tree=generax_prank_trees ) %dopar%
+		filter_by_number_species(tree, min_species)
+generax_prank_trees_passfilter=generax_prank_trees_passfilter[ ! is.na( generax_prank_trees_passfilter )]
+
+```
+
+
+
+Read in expression data as TPM data and clr(TPM)
+```{r}
+Bothriechis_transcripts_CLR <- read.csv("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/RSEM/Bothriechis_transcripts_CLR_2.csv")
+
+```
+
+
+Subset data to those in tree. Add_expression_to_tree function modified from Dunn 2018
+```{r}
+
+add_expression_to_tree = function( tree, expression ){
+		tree@data %<>% 
+			left_join( expression, by = c( "clade_label" = "gene_id" ) )
+		return( tree )
+}
+
+generax_prank_TPM<-foreach( tree=generax_prank_trees_passfilter ) %dopar% 
+  add_expression_to_tree( tree, Bothriechis_transcripts_CLR )
+
+
+```
+
+
+Label internal nodes as toxin or nontoxin. We will use three labels, Toxin, Nontoxin, Unknown. If All terminals in an orthogroup are either toxin or nontoxin, we will make the parsimonous assumption that the internal nodes are conserved as the same state (i.e. no hidden transitions and reversions). Where a parent node has toxin and nontoxin daughters, we will label it as unknown.
+```{r}
+
+label_internal_toxin_nontoxin = function(nhx){
+  toxin_nontoxin = nhx@data$Toxin_Nontoxin
+  terminal_classes = na.omit(toxin_nontoxin)
+  if (length(unique(terminal_classes)) == 1){
+    toxin_nontoxin[1:length(toxin_nontoxin)] = unique(terminal_classes)
+    nhx@data$Toxin_Nontoxin = toxin_nontoxin
+  }
+  return(nhx)
+}
+
+label_internal_Toxin_Class = function(nhx){
+  toxin_class = nhx@data$Toxin_Class
+  terminal_classes = na.omit(toxin_class)
+  if (length(unique(terminal_classes)) == 1){
+    toxin_class[1:length(toxin_class)] = unique(terminal_classes)
+    nhx@data$Toxin_Class = toxin_class
+  }
+  return(nhx)
+}
+
+```
+
+
+
+```{r}
+generax_prank_TPM_internal_labelled = foreach( tree=generax_prank_TPM) %dopar%
+  label_internal_toxin_nontoxin(tree)
+generax_prank_TPM_internal_labelled = foreach( tree=generax_prank_TPM_internal_labelled) %dopar%  
+  label_internal_Toxin_Class(tree)
+```
+
+
+
+Remove trees without sufficient expression data.
+```{r}
+min_genes_with_expression = 4
+
+generax_prank_TPM_pruned = foreach( tree=generax_prank_TPM_internal_labelled) %dopar%
+  drop_empty_tips(tree, min_genes_with_expression=min_genes_with_expression)
+
+```
+
+
+Set calibration times for each of the kinds of genetrees. Ages taken from estimates of divergence.
+```{r}
+
+calibration_times_generax = data.frame(
+		age =
+			c( 7.6797, 7.5103, 6.0388, 3.0633, 8.2438, 9.2064, 12.7790, 8.8461, 18.0425 ), 
+		clade = 
+			c("species_0","species_2","species_3","species_4","species_5","species_6","species_7","species_8","species_9"	),
+		stringsAsFactors=FALSE
+)
+
+```
+
+
+Show species tree
+```{r}
+
+plot(generax_species_tree, show.node.label = TRUE)
+
+```
+
+
+
+Calibrate trees:
+```{r}
+calibrated_generax_prank_TPM = calibrate_trees( 
+			generax_prank_TPM_pruned, 
+			calibration_times_generax, 
+			model="correlated"
+		)
+```
+
+
+Filter out trees with ages that are exceptionally old which likely represent mis-assigned orthologous groups.
+```{r}
+filter_based_on_age = function(nhx, max_age){
+  if (max(node.depth.edgelength(nhx@phylo)) < max_age){
+    return(nhx)
+  }
+  else{return(NA)}
+}
+
+max_age = 90
+
+calibrated_generax_prank_TPM = foreach( tree=calibrated_generax_prank_TPM) %dopar%
+  filter_based_on_age(tree, max_age)
+calibrated_generax_prank_TPM=calibrated_generax_prank_TPM[ ! is.na( calibrated_generax_prank_TPM )]
+
+
+setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+save.image( "manuscript_checkpoint_calibrate_trees.RData" )
+
+```
+
+
+
+
+
+Sample parameters.
+```{r}
+
+
+calibrated_generax_prank_TPM = 
+		foreach( nhx=calibrated_generax_prank_TPM ) %dopar% 
+			add_model_parameters( nhx )
+
+
+```
+
+
+Create dataframes used for comparative analyses
+```{r}
+
+# Calculate the contrasts from the trees and associated expression data
+generax_prank_pic = add_pics_to_trees( calibrated_generax_prank_TPM )
+
+# Collect all the contrasts in a single tibble, one row per contrast
+generax_prank_nodes_contrast = summarize_contrasts( generax_prank_pic )
+	
+# Test if the mean rank of duplication pics is greater than speciation pics
+generax_prank_wilcox_test_result = wilcox_oc( generax_prank_nodes_contrast )
+
+# Collect tree statistics in a single tibble, one row per tree
+generax_prank_tree_summary = summarize_trees( generax_prank_pic )
+
+# Collect edge statistics in a single tibble, one row per edge
+generax_prank_edge_summary = summarize_edges( generax_prank_pic )
+
+setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+
+save.image("manuscript_checkpoint_contrasts.RData")
+
+```
+
+
+
+
+
+```{r}
+toxin_l<-subset(generax_prank_tree_summary, Toxin_Nontoxin == 'Toxin')
+
+
+setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+write.csv(toxin_l, "Toxin_tree_estimates.csv")
+```
+
+
+
+
+
+
+Run bayou for PLA2s, SVMPs, and SVSPs
+```{r}
+#install.packages("devtools")
+#require(devtools)
+#install_github("uyedaj/bayou")
+require(bayou)
+library("RColorBrewer")
+
+library(patchwork)
+
+########################################################################################################
+
+PLA2_colors<-setNames(c("black", "red", "blue", "green", "yellow","orange"),c(1,2,3,4,5,6))
+
+
+PLA2<-generax_prank_pic[[3]]
+PLA2<-reorder(PLA2@phylo, "postorder")
+
+MEvar <- 0.1
+PLA2_dat<-generax_prank_pic[[3]]@data$Ave_clrTPM[1:length(generax_prank_pic[[3]]@phylo$tip.label)]
+PLA2_dat<-setNames(PLA2_dat,generax_prank_pic[[3]]@phylo$tip.label)
+
+priorOU <- make.prior(PLA2, 
+                      dists=list(dalpha="dhalfcauchy", dsig2="dhalfcauchy", 
+                                 dk="cdpois", dtheta="dnorm"),
+                      param=list(dalpha=list(scale=0.1), dsig2=list(scale=0.1),
+                                 dk=list(lambda=10, kmax=50), dsb=list(bmax=1, prob=1), 
+                                 dtheta=list(mean=mean(PLA2_dat), sd=1.5*sd(PLA2_dat)))
+)
+
+par(mfrow=c(1,1))
+startpars <- priorSim(priorOU, PLA2, plot=TRUE)$pars[[1]]
+priorOU(startpars)
+
+set.seed(1)
+mcmcOU <- bayou.makeMCMC(PLA2, PLA2_dat, SE=MEvar, prior=priorOU, 
+                         new.dir=TRUE, outname="modelOU_PLA2", plot.freq=NULL) # Set up the MCMC
+mcmcOU$run(10000000) # Run the MCMC
+
+chainOU <- mcmcOU$load()
+
+save.image("manuscript_checkpoint_PLA2chain.RData")
+
+chainOU <- set.burnin(chainOU, 0.3)
+summary(chainOU)
+plot(chainOU, auto.layout=FALSE)
+
+
+par(mfrow=c(2,2))
+#plotBayoupars(truepars, PLA2, main = "True parameters")
+p1<-plotSimmap.mcmc(chainOU, burnin = 0.3, pp.cutoff = 0.5,cex=0.45,lwd = 2,edge.type = 'regime', pp.labels = FALSE, circle.cex.max = 2)
+plotBayoupars()
+plotBranchHeatMap(PLA2, chainOU, "theta", burnin = 0.3, pal = cm.colors,cex=0.5)
+p2<-phenogram.density(PLA2, PLA2_dat, burnin = 0.3, chainOU, pp.cutoff = 0.5)
+
+########################################################################################################
+SVMP<-generax_prank_pic[[2]]
+SVMP<-reorder(SVMP@phylo, "postorder")
+
+MEvar <- 0.1
+SVMP_dat<-generax_prank_pic[[2]]@data$Ave_clrTPM[1:length(generax_prank_pic[[2]]@phylo$tip.label)]
+SVMP_dat<-setNames(SVMP_dat,generax_prank_pic[[2]]@phylo$tip.label)
+
+priorOU <- make.prior(SVMP, 
+                      dists=list(dalpha="dhalfcauchy", dsig2="dhalfcauchy", 
+                                 dk="cdpois", dtheta="dnorm"),
+                      param=list(dalpha=list(scale=0.1), dsig2=list(scale=0.1),
+                                 dk=list(lambda=10, kmax=50), dsb=list(bmax=1, prob=1), 
+                                 dtheta=list(mean=mean(SVMP_dat), sd=1.5*sd(SVMP_dat)))
+)
+
+par(mfrow=c(1,1))
+startpars <- priorSim(priorOU, SVMP, plot=TRUE)$pars[[1]]
+priorOU(startpars)
+
+set.seed(1)
+mcmcOU_SVMP <- bayou.makeMCMC(SVMP, SVMP_dat, SE=MEvar, prior=priorOU, 
+                         new.dir=TRUE, outname="modelOU_SVMP", plot.freq=NULL) # Set up the MCMC
+mcmcOU_SVMP$run(10000000) # Run the MCMC
+
+chainOU_SVMP <- mcmcOU_SVMP$load()
+
+save.image("manuscript_checkpoint_SVMPchain.RData")
+
+chainOU_SVMP <- set.burnin(chainOU_SVMP, 0.3)
+summary(chainOU_SVMP)
+plot(chainOU_SVMP, auto.layout=FALSE)
+
+
+par(mfrow=c(2,2))
+#plotBayoupars(truepars, SVMP, main = "True parameters")
+p3<-plotSimmap.mcmc(chainOU_SVMP, burnin = 0.3, pp.cutoff = 0.5,cex=0.25, edge.type = 'regimes', pp.labels = FALSE, lwd=2, circle.cex.max = 2)
+plotBranchHeatMap(SVMP, chainOU_SVMP, "theta", burnin = 0.3, pal = cm.colors,cex=0.5)
+p4<-phenogram.density(SVMP, SVMP_dat, burnin = 0.3, chainOU_SVMP, pp.cutoff = 0.5)
+
+
+
+
+########################################################################################################  
+SVSP<-generax_prank_pic[[1]]
+SVSP<-reorder(SVSP@phylo, "postorder")
+
+MEvar <- 0.1
+SVSP_dat<-generax_prank_pic[[1]]@data$Ave_clrTPM[1:length(generax_prank_pic[[1]]@phylo$tip.label)]
+SVSP_dat<-setNames(SVSP_dat,generax_prank_pic[[1]]@phylo$tip.label)
+
+priorOU <- make.prior(SVSP, 
+                      dists=list(dalpha="dhalfcauchy", dsig2="dhalfcauchy", 
+                                 dk="cdpois", dtheta="dnorm"),
+                      param=list(dalpha=list(scale=0.1), dsig2=list(scale=0.1),
+                                 dk=list(lambda=10, kmax=50), dsb=list(bmax=1, prob=1), 
+                                 dtheta=list(mean=mean(SVSP_dat), sd=1.5*sd(SVSP_dat)))
+)
+
+par(mfrow=c(1,1))
+startpars <- priorSim(priorOU, SVSP, plot=TRUE)$pars[[1]]
+priorOU(startpars)
+
+set.seed(1)
+mcmcOU_SVSP <- bayou.makeMCMC(SVSP, SVSP_dat, SE=MEvar, prior=priorOU, 
+                         new.dir=TRUE, outname="modelOU_SVSP", plot.freq=NULL) # Set up the MCMC
+mcmcOU_SVSP$run(10000000) # Run the MCMC
+
+chainOU_SVSP <- mcmcOU_SVSP$load()
+
+save.image("manuscript_checkpoint_SVSPchain.RData")
+
+chainOU_SVSP <- set.burnin(chainOU_SVSP, 0.3)
+summary(chainOU_SVSP)
+plot(chainOU_SVSP, auto.layout=FALSE)
+
+
+par(mfrow=c(2,2))
+#plotBayoupars(truepars, SVSP, main = "True parameters")
+p5<-plotSimmap.mcmc(chainOU_SVSP, burnin = 0.3, pp.cutoff = 0.3,cex=0.15, lwd = 2, pp.labels = FALSE)
+plotBranchHeatMap(SVSP, chainOU_SVSP, "theta", burnin = 0.3, pal = cm.colors,cex=0.5)
+p6<-phenogram.density(SVSP, SVSP_dat, burnin = 0.3, chainOU_SVSP, pp.cutoff = 0.3)
+
+
+
+(p1 | p2) /
+(p3 | p4) /
+(p5 | p6)
+
+```
+
+
+
+
+
+
+Parametric bootstrapping to destinguish OU from BM
+```{r}
+
+library(motmot)
+
+parametric_bootstrap_tree = function( nhx, reps ){
+  sim_trait_BM<-fastBM(nhx@phylo, a=nhx@phylo$model_bm$opt$z0,
+                    sig2=nhx@phylo$model_bm$opt$sigsq,
+                    nsim=reps)
+  
+  sim_trait_OU<-fastBM(nhx@phylo, a=nhx@phylo$model_ou$opt$z0,
+                       alpha=nhx@phylo$model_ou$opt$alpha,
+                       sig2=nhx@phylo$model_ou$opt$sigsq,
+                       theta=nhx@phylo$model_ou$opt$z0,
+                    nsim=reps)
+  
+###################################################################################################################
+  x = as.matrix(nhx@data$Ave_clrTPM[1:length(nhx@phylo$tip.label)])
+  rownames(x) = nhx@data$clade_label[1:length(nhx@phylo$tip.label)]
+  lam1<-phylosig(nhx@phylo, x, method = "lambda")
+  
+  lambda_traits<-transformPhylo.sim(nhx@phylo, n = reps, model = "lambda", lambda = lam1$lambda)
+  
+  
+  ## estimate lambda and kappa
+  #lambda<-apply(sim_trait_BM,2,phylosig,tree=nhx@phylo,method="lambda")
+  #kappa<-apply(sim_trait_BM,2,phylosig,tree=nhx@phylo)
+  
+  lambda_list<-c()
+  for (i in 1:dim(lambda_traits)[2]){
+    lam<-phylosig(nhx@phylo, lambda_traits[,i], method = "lambda")
+    lambda_list=c(lambda_list,as.numeric(lam$lambda))
+  }
+  
+  lambda_sig_list<-c()
+  for (i in 1:dim(lambda_traits)[2]){
+    sig<-fitContinuous(nhx@phylo,lambda_traits[,i],model="BM",ncores=1)
+    lambda_sig_list=c(lambda_sig_list,as.numeric(sig$opt$sigsq))
+  }
+  
+  lambda_z0_list<-c()
+  for (i in 1:dim(lambda_traits)[2]){
+    z0<-fitContinuous(nhx@phylo,lambda_traits[,i],model="BM",ncores=1)
+    lambda_z0_list=c(lambda_z0_list,as.numeric(sig$opt$z0))
+  }
+ 
+  lambda_dat<-c(mean(lambda_list),quantile(lambda_list,0.025),quantile(lambda_list,0.975))
+  lambda_sig_dat<-c(mean(lambda_sig_list),quantile(lambda_sig_list,0.025),quantile(lambda_sig_list,0.975))
+  lambda_z0_dat<-c(mean(lambda_z0_list),quantile(lambda_z0_list,0.025),quantile(lambda_z0_list,0.975))
+  #kappa_dat<-c(mean(kappa),quantile(kappa,c(0.025,0.975))[1],quantile(kappa,c(0.025,0.975))[2])
+  
+  BMsim_OUfit<-fitContinuous(nhx@phylo,sim_trait_BM,model="OU",ncores=1)
+  BMsim_BMfit<-fitContinuous(nhx@phylo,sim_trait_BM,model="BM",ncores=1)
+  OUsim_OUfit<-fitContinuous(nhx@phylo,sim_trait_OU,model="OU",ncores=1)
+  OUsim_BMfit<-fitContinuous(nhx@phylo,sim_trait_OU,model="BM",ncores=1)
+  
+  
+  BMsim_OUfit_AIC<-vector()
+  for(i in 1:reps){
+    BMsim_OUfit_AIC<-c(BMsim_OUfit_AIC,BMsim_OUfit[[i]]$opt$aic)
+  }
+  
+  BMsim_BMfit_AIC<-vector()
+  for(i in 1:reps){
+    BMsim_BMfit_AIC<-c(BMsim_BMfit_AIC,BMsim_BMfit[[i]]$opt$aic)
+  }
+  
+  BM_sigma2<-vector()
+  for(i in 1:reps){
+    BM_sigma2<-c(BM_sigma2,BMsim_BMfit[[i]]$opt$sigsq)
+  }
+  
+  BM_z0<-vector()
+  for(i in 1:reps){
+    BM_z0<-c(BM_z0,BMsim_BMfit[[i]]$opt$z0)
+  }
+  
+  OUsim_OUfit_AIC<-vector()
+  for(i in 1:reps){
+    OUsim_OUfit_AIC<-c(OUsim_OUfit_AIC,OUsim_OUfit[[i]]$opt$aic)
+  }
+  
+  OU_alpha<-vector()
+  for(i in 1:reps){
+    OU_alpha<-c(OU_alpha,OUsim_OUfit[[i]]$opt$alpha)
+  }
+  
+  OU_theta<-vector()
+  for(i in 1:reps){
+    OU_theta<-c(OU_theta,OUsim_OUfit[[i]]$opt$z0)
+  }
+  
+  OU_sigma2<-vector()
+  for(i in 1:reps){
+    OU_sigma2<-c(OU_sigma2,OUsim_OUfit[[i]]$opt$sigsq)
+  }
+   
+  OUsim_BMfit_AIC<-vector()
+  for(i in 1:reps){
+    OUsim_BMfit_AIC<-c(OUsim_BMfit_AIC,OUsim_BMfit[[i]]$opt$aic)
+  }
+ 
+  
+  BMsim_OUfit_AIC_mean = mean(BMsim_OUfit_AIC)
+  BMsim_BMfit_AIC_mean = mean(BMsim_BMfit_AIC)
+  OUsim_OUfit_AIC_mean = mean(OUsim_OUfit_AIC)
+  OUsim_BMfit_AIC_mean = mean(OUsim_BMfit_AIC)
+  BM_sigma2_mean = mean(BM_sigma2)
+  BM_z0_mean = mean(BM_z0)
+  OU_alpha_mean = mean(OU_alpha)
+  OU_theta_mean = mean(OU_theta)
+  OU_sigma2_mean = mean(OU_sigma2)
+  
+  BMsim_OUfit_AIC_quantile = quantile(BMsim_OUfit_AIC, c(0.025, 0.975))
+  BMsim_BMfit_AIC_quantile = quantile(BMsim_BMfit_AIC, c(0.025, 0.975))
+  OUsim_OUfit_AIC_quantile = quantile(OUsim_OUfit_AIC, c(0.025, 0.975))
+  OUsim_BMfit_AIC_quantile = quantile(OUsim_BMfit_AIC, c(0.025, 0.975))
+  BM_sigma2_quantile = quantile(BM_sigma2, c(0.025, 0.975))
+  BM_z0_quantile = quantile(BM_z0, c(0.025, 0.975))
+  OU_alpha_quantile = quantile(OU_alpha, c(0.025, 0.975))
+  OU_theta_quantile = quantile(OU_theta, c(0.025, 0.975))
+  OU_sigma2_quantile = quantile(OU_sigma2, c(0.025, 0.975))
+  
+  
+  
+  summaries = data.frame()
+  summaries = rbind(c(lam1$lambda,lambda_dat[1],lambda_dat[2],lambda_dat[3],
+                          lambda_sig_dat[1],lambda_sig_dat[2],lambda_sig_dat[3],
+                          lambda_z0_dat[1],lambda_z0_dat[2],lambda_z0_dat[3],
+                          BM_sigma2_mean,BM_sigma2_quantile[[1]],BM_sigma2_quantile[[2]],
+                          BM_z0_mean,BM_z0_quantile[[1]],BM_z0_quantile[[2]],
+                          OU_alpha_mean,OU_alpha_quantile[[1]],OU_alpha_quantile[[2]],
+                          OU_theta_mean,OU_theta_quantile[[1]],OU_theta_quantile[[2]],
+                          OU_sigma2_mean,OU_sigma2_quantile[[1]],OU_sigma2_quantile[[2]],
+                      #kappa_dat[1],kappa_dat[2],kappa_dat[3],
+                          BMsim_OUfit_AIC_mean,BMsim_OUfit_AIC_quantile[[1]],BMsim_OUfit_AIC_quantile[[2]],
+                          BMsim_BMfit_AIC_mean,BMsim_BMfit_AIC_quantile[[1]],BMsim_BMfit_AIC_quantile[[2]],
+                          OUsim_OUfit_AIC_mean,OUsim_OUfit_AIC_quantile[[1]],OUsim_OUfit_AIC_quantile[[2]],
+                          OUsim_BMfit_AIC_mean,OUsim_BMfit_AIC_quantile[[1]],OUsim_BMfit_AIC_quantile[[2]]))
+  
+  colnames(summaries)=c("lambda","lambda_est","lambda_lowerCI","lambda_upperCI",
+                        "lambda_sig_mean","lambda_sig_lowerCI","lambda_sig_upperCI",
+                        "lambda_z0_mean","lambda_z0_lowerCI","lambda_z0_upperCI",
+                        "BM_sigma2_mean","BM_sigma2_lowerquantile","BM_sigma2_quantile",
+                        "BM_z0_mean","BM_z0_lowerquantile","BM_z0_upperquantile",
+                        "OU_alpha_mean","OU_alpha_lowerquantile","OU_alpha_upperquantile",
+                        "OU_theta_mean","OU_theta_lowerquantile","OU_theta_upperquantile",
+                        "OU_sigma2_mean","OU_sigma2_lowerquantile","OU_sigma2_upperquantile",
+                        #"kappa","kappa_lowerCI","kappa_upperCI",
+                        "BMsim_OUfit_AIC_mean","BMsim_OUfit_AIC_lowerquantile","BMsim_OUfit_AIC_upperquantile",
+                        "BMsim_BMfit_AIC_mean","BMsim_BMfit_AIC_lowerquantile","BMsim_BMfit_AIC_upperquantile",
+                        "OUsim_OUfit_AIC_mean","OUsim_OUfit_AIC_lowerquantile","OUsim_OUfit_AIC_upperquantile",
+                        "OUsim_BMfit_AIC_mean","OUsim_BMfit_AIC_quantile","OUsim_BMfit_AIC_quantile")
+  
+  return(summaries)
+  
+}
+
+trees = calibrated_generax_prank_TPM[1:3]
+
+output = foreach(tree=trees) %dopar%
+  try(parametric_bootstrap_tree(tree, reps=1000))
+
+bootstrap_param_summary=data.frame()
+for(i in 1:length(output)){
+  bootstrap_param_summary = rbind(bootstrap_param_summary, output[[i]])
+}
+
+
+save.image("Parametric_bootstraps_1000.RData")
+
+length(bootstrap_param_summary)
+
+#setwd("~/Dropbox/Andrew/DataSets_Manuscripts/Bothriechis_VG_Trans/Analyses/OG_nuc_seqs/")
+
+
+#save.image("Parametric_bootstraps.RData")
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+library("RColorBrewer")
+
+toxin_colors<-palette(c("#000000","#CC33FF","green3","#008080","peachpuff","purple","orange","#fffac8",
+                        "red3","red1","#800000","deepskyblue1","yellow", "darkorange1",
+                        "palegreen4", "#aa6e28","maroon1","grey","blueviolet","darkgoldenrod","olivedrab1","deeppink1"))
+names(toxin_colors)<-c("BPP","CRISP","CTL","HYAL","KUN","LAAO","MYO","NGF","PLA2","Neurotoxic PLA2","PLB","SVMP",
+                       "SVSP","VEGF","Vespryn","Ficolin","NUC","Waprin","3FTx","PDE","FusedToxin","KAZ")
+```
+
+
+
+
+
+
+
+
+
+
+Okay, let's make plots and run statistics for specific hypotheses
+Hypothesis 1) Toxin gene expression evolves more rapidly than nontoxin genes
+Prediction- estimates of sigma2 (variance in expression is higher in toxins than in nontoxins)
+```{r}
+library("ggplot2")
+library("cowplot")
+
+#colors=c("SVSP","SVMP","PLA2","CTL","VEGF","CTL","KAZ","VEGF","HYAL","LAAO","NGF","NUC","PDE","Waprin","CRISP","Vespryn")
+colors=c("yellow","deepskyblue1","red1","green3","darkorange1","green3","deeppink1","darkorange1",
+         "#008080","purple","#fffac8","maroon1","darkgoldenrod","grey","#CC33FF", "palegreen4")
+  
+hist_subset<-subset(generax_prank_tree_summary, sigsq_bm < 1)
+
+nontoxin_sigsq<-subset(hist_subset, Toxin_Nontoxin == 'Nontoxin')
+toxin_sigsq<-subset(hist_subset, Toxin_Nontoxin == 'Toxin')
+
+wilcox.test(toxin_sigsq$sigsq_bm,nontoxin_sigsq$sigsq_bm,alternative = "greater")
+mean(nontoxin_sigsq$sigsq_bm)
+mean(toxin_sigsq$sigsq_bm)
+
+arrow.cor1<-data.frame(x1=double(),y1=double(),x2=double(),y2=double())
+text1<-data.frame(x1=double(),y1=double())
+lines1<-data.frame(x1=c(),y1=double(),x2=double(),y2=double())
+for (i in 1:length(toxin_sigsq$sigsq_bm)){
+    row<-c(toxin_sigsq$sigsq_bm[i], -1, toxin_sigsq$sigsq_bm[i], 0)
+    lines1 <- rbind.data.frame(lines1,row)
+    colnames(lines1)=c("x1","y1","x2","y2")
+  
+    text_row<-c(toxin_sigsq$sigsq_bm[i], 16)
+    text1<-rbind.data.frame(text1,text_row)
+    
+    arrow_row<-c(toxin_sigsq$sigsq_bm[i],15,toxin_sigsq$sigsq_bm[i],1)
+    arrow.cor1<-rbind.data.frame(arrow.cor1,arrow_row)
+    colnames(arrow.cor1)=c("x1","y1","x2","y2")
+}
+
+text1<-cbind(toxin_sigsq$Toxin_Class,text1)
+colnames(text1)=c("Class","x1","y1")
+
+plot<-ggplot(nontoxin_sigsq, aes(x=sigsq_bm)) + geom_density(aes(y=..density..),,alpha=.2, fill="gray25") +
+  labs(y="Density", x = "Sigma^2") + 
+   geom_text(aes(x=0.25,y=45,label=c("Nontoxins = 1332  Mean nontoxin sigma^2 = 0.02 \n Toxins = 16  Mean toxin dN/dS = 0.11 \n p-value = <0.001")),size=4) +
+ theme_cowplot()
+
+plot+
+  annotate('segment',x=arrow.cor1$x1,y=arrow.cor1$y1,xend=arrow.cor1$x2,yend=arrow.cor1$y2,
+           lineend = 7, linejoin=c('mitre'), size = 4, col = factor(colors),
+           alpha=0.5,arrow = arrow(length = unit(0.1,"inches"))) +
+  scale_fill_manual(values=toxin_colors) +
+  geom_text(data=text1,aes(x=x1, y=y1,label=Class),
+            hjust="left", size = 3)  
+
+
+```
+
+
+
+Show that in our trees most duplication events are early and most speciation events are late and test for it.
+```{r}
+library("car")
+
+speciations<-subset(generax_prank_nodes_contrast, Event == 'Speciation')
+duplications<-subset(generax_prank_nodes_contrast, Event == 'Duplication')
+
+toxin_nodes<-subset(generax_prank_nodes_contrast, Toxin_Nontoxin == 'Toxin')
+toxin_nodes_speciations<-subset(toxin_nodes, Event == 'Speciation')
+toxin_nodes_duplications<-subset(toxin_nodes, Event == 'Duplication')
+
+
+
+wilcox.test(speciations$node_depth,duplications$node_depth,alternative = "less")
+
+ggplot(generax_prank_nodes_contrast, aes(x = node_depth, y = Event, fill = factor(stat(quantile)))) + 
+  stat_density_ridges(
+    geom = "density_ridges_gradient", calc_ecdf = TRUE,
+    quantiles = 3, quantile_lines = TRUE, bandwidth = 1) +
+  scale_fill_viridis_d(name = "Quartiles") + xlim(c(0,30)) +
+  theme_bw()
+  
+
+print('Duplication')
+mean(subset(generax_prank_nodes_contrast,Event == 'Duplication')$node_age)
+print('Speciation')
+mean(subset(generax_prank_nodes_contrast,Event == 'Speciation')$node_age)
+
+
+wilcox.test(toxin_nodes_speciations$node_depth,toxin_nodes_duplications$node_depth,alternative = "less")
+
+ggplot(toxin_nodes, aes(x = node_depth, y = Event, fill = factor(stat(quantile)))) +
+  stat_density_ridges(
+    geom = "density_ridges_gradient", calc_ecdf = TRUE,
+    quantiles = 3, quantile_lines = TRUE ) +
+  scale_fill_viridis_d(name = "Quartiles") +
+  theme_bw()
+  
+
+
+print('Duplication')
+mean(subset(toxin_nodes,Event == 'Duplication')$node_age)
+print('Speciation')
+mean(subset(toxin_nodes,Event == 'Speciation')$node_age)
+
+```
+
+
+
+
+Hypothesis 2-Toxins evolve more rapidly following duplication
+Plot1 - global correlation of number duplications v sigma
+```{r}
+library("ggplot2")
+library("cowplot")
+
+
+colors=c("yellow","deepskyblue1","red1","green3","darkorange1","green3","deeppink1","darkorange1",
+         "#008080","purple","#fffac8","maroon1","darkgoldenrod","grey","#CC33FF", "palegreen4")
+  
+nontoxin_k<-subset(generax_prank_tree_summary, Toxin_Nontoxin == 'Nontoxin')
+toxin_k<-subset(generax_prank_tree_summary, Toxin_Nontoxin == 'Toxin')
+
+wilcox.test(toxin_k$K,nontoxin_k$K,alternative = "two.sided")
+mean(nontoxin_k$K)
+mean(toxin_k$K)
+
+arrow.cor1<-data.frame(x1=double(),y1=double(),x2=double(),y2=double())
+text1<-data.frame(x1=double(),y1=double())
+lines1<-data.frame(x1=c(),y1=double(),x2=double(),y2=double())
+for (i in 1:length(toxin_k$K)){
+    row<-c(toxin_k$K[i], -1, toxin_k$K[i], 0)
+    lines1 <- rbind.data.frame(lines1,row)
+    colnames(lines1)=c("x1","y1","x2","y2")
+  
+    text_row<-c(toxin_k$K[i], 0.6)
+    text1<-rbind.data.frame(text1,text_row)
+    
+    arrow_row<-c(toxin_k$K[i],.5,toxin_k$K[i],.06)
+    arrow.cor1<-rbind.data.frame(arrow.cor1,arrow_row)
+    colnames(arrow.cor1)=c("x1","y1","x2","y2")
+}
+
+text1<-cbind(toxin_k$Toxin_Class,text1)
+colnames(text1)=c("Class","x1","y1")
+
+plot<-ggplot(nontoxin_k, aes(x=K)) + geom_density(aes(y=..density..),,alpha=.2, fill="gray25") +
+  labs(y="Density", x = "K") + 
+   geom_text(aes(x=2.5,y=1.5,label=c("Nontoxins = 1332  Mean nontoxin K = 0.71 \n Toxins = 16  Mean toxin K = 0.66 \n p-value = 0.93")),size=4) +
+ theme_cowplot()
+
+plot+
+  annotate('segment',x=arrow.cor1$x1,y=arrow.cor1$y1,xend=arrow.cor1$x2,yend=arrow.cor1$y2,
+           lineend = 7, linejoin=c('mitre'), size = 4, col = factor(colors),
+           alpha=0.5,arrow = arrow(length = unit(0.1,"inches"))) +
+  scale_fill_manual(values=toxin_colors) +
+  geom_text(data=text1,aes(x=x1, y=y1,label=Class),
+            hjust="left", size = 3)  
+
+
+
+
+######################################################################################################################
+
+library("cowplot")
+
+colors=c("yellow","deepskyblue1","red1","green3","darkorange1","green3","deeppink1","darkorange1",
+         "#008080","purple","#fffac8","maroon1","darkgoldenrod","grey","#CC33FF", "palegreen4")
+  
+nontoxin_l<-subset(generax_prank_tree_summary, Toxin_Nontoxin == 'Nontoxin')
+toxin_l<-subset(generax_prank_tree_summary, Toxin_Nontoxin == 'Toxin')
+
+
+
+wilcox.test(toxin_l$Lambda,nontoxin_l$Lambda,alternative = "two.sided")
+mean(nontoxin_l$Lambda)
+mean(toxin_l$Lambda)
+
+
+
+
+arrow.cor1<-data.frame(x1=double(),y1=double(),x2=double(),y2=double())
+text1<-data.frame(x1=double(),y1=double())
+lines1<-data.frame(x1=c(),y1=double(),x2=double(),y2=double())
+for (i in 1:length(toxin_l$Lambda)){
+    row<-c(toxin_l$Lambda[i], -1, toxin_l$Lambda[i], 0)
+    lines1 <- rbind.data.frame(lines1,row)
+    colnames(lines1)=c("x1","y1","x2","y2")
+  
+    text_row<-c(toxin_l$Lambda[i], 0.7)
+    text1<-rbind.data.frame(text1,text_row)
+    
+    arrow_row<-c(toxin_l$Lambda[i],0.6,toxin_l$Lambda[i],0.1)
+    arrow.cor1<-rbind.data.frame(arrow.cor1,arrow_row)
+    colnames(arrow.cor1)=c("x1","y1","x2","y2")
+}
+
+text1<-cbind(toxin_l$Toxin_Class,text1)
+colnames(text1)=c("Class","x1","y1")
+
+plot<-ggplot(nontoxin_l, aes(x=Lambda)) + geom_density(aes(y=..density..),,alpha=.2, fill="gray25") +
+  labs(y="Density", x = "lambda") + 
+   geom_text(aes(x=0.75,y=2.5,label=c("Nontoxins = 1332  Mean nontoxin lambda = 0.26 \n Toxins = 16  Mean toxin lambda = 0.51 \n p-value = 0.02")),size=4) +
+ theme_cowplot()
+
+plot+
+  annotate('segment',x=arrow.cor1$x1,y=arrow.cor1$y1,xend=arrow.cor1$x2,yend=arrow.cor1$y2,
+           lineend = 7, linejoin=c('mitre'), size = 4, col = factor(colors),
+           alpha=0.5,arrow = arrow(length = unit(0.1,"inches"))) +
+  scale_fill_manual(values=toxin_colors) +
+  geom_text(data=text1,aes(x=x1, y=y1,label=Class),
+            hjust="left", size = 3)  
+
+
+######################################################### Exclude Tiny lambdas ##############################################################################
+
+nontoxin_l_sub<-subset(nontoxin_l, Lambda > 0.0001)
+toxin_l_sub<-subset(toxin_l, Lambda > 0.0001)
+wilcox.test(toxin_l_sub$Lambda,nontoxin_l_sub$Lambda,alternative = "two.sided")
+mean(nontoxin_l_sub$Lambda)
+mean(toxin_l_sub$Lambda)
+
+
+arrow.cor1<-data.frame(x1=double(),y1=double(),x2=double(),y2=double())
+text1<-data.frame(x1=double(),y1=double())
+lines1<-data.frame(x1=c(),y1=double(),x2=double(),y2=double())
+for (i in 1:length(toxin_l_sub$Lambda)){
+    row<-c(toxin_l_sub$Lambda[i], -1, toxin_l_sub$Lambda[i], 0)
+    lines1 <- rbind.data.frame(lines1,row)
+    colnames(lines1)=c("x1","y1","x2","y2")
+  
+    text_row<-c(toxin_l_sub$Lambda[i], 0.7)
+    text1<-rbind.data.frame(text1,text_row)
+    
+    arrow_row<-c(toxin_l_sub$Lambda[i],0.6,toxin_l_sub$Lambda[i],0.1)
+    arrow.cor1<-rbind.data.frame(arrow.cor1,arrow_row)
+    colnames(arrow.cor1)=c("x1","y1","x2","y2")
+}
+
+
+text1<-cbind(toxin_l_sub$Toxin_Class,text1)
+colnames(text1)=c("Class","x1","y1")
+
+plot<-ggplot(nontoxin_l_sub, aes(x=Lambda)) + geom_density(aes(y=..density..),,alpha=.2, fill="gray25") +
+  labs(y="Density", x = "lambda") + 
+   geom_text(aes(x=0.75,y=1.75,label=c("Nontoxins = 410  Mean nontoxin lambda = 0.86 \n Toxins = 16  Mean toxin lambda = 0.51 \n p-value = 0.01")),size=4) +
+ theme_cowplot() + ylim(c(0,2.1))
+
+plot+
+  annotate('segment',x=arrow.cor1$x1,y=arrow.cor1$y1,xend=arrow.cor1$x2,yend=arrow.cor1$y2,
+           lineend = 7, linejoin=c('mitre'), size = 4, col = factor(colors),
+           alpha=0.5,arrow = arrow(length = unit(0.1,"inches"))) +
+  scale_fill_manual(values=toxin_colors) +
+  geom_text(data=text1,aes(x=x1, y=y1,label=Class),
+            hjust="left", size = 3)  
+
+```
+
+
+
+Test for differences among PIC's bewteen toxins and nontoxins
+```{r}
+library(patchwork)
+
+nontoxin_contrasts = subset(generax_prank_nodes_contrast, Toxin_Nontoxin == 'Nontoxin')
+toxin_contrasts = subset(generax_prank_nodes_contrast, Toxin_Nontoxin == 'Toxin')
+PLA2_contrasts = subset(generax_prank_nodes_contrast, Toxin_Class == 'PLA2')
+SVMP_contrasts = subset(generax_prank_nodes_contrast, Toxin_Class == 'SVMP')
+SVSP_contrasts = subset(generax_prank_nodes_contrast, Toxin_Class == 'SVSP')
+
+
+
+toxin_speciation<-subset(toxin_contrasts,Event == 'Speciation')
+toxin_duplication<-subset(toxin_contrasts,Event == 'Duplication')
+nontoxin_speciation<-subset(nontoxin_contrasts,Event == 'Speciation')
+nontoxin_duplication<-subset(nontoxin_contrasts,Event == 'Duplication')
+PLA2_speciation<-subset(PLA2_contrasts,Event == 'Speciation')
+PLA2_duplication<-subset(PLA2_contrasts,Event == 'Duplication')
+SVMP_speciation<-subset(SVMP_contrasts,Event == 'Speciation')
+SVMP_duplication<-subset(SVMP_contrasts,Event == 'Duplication')
+SVSP_speciation<-subset(SVSP_contrasts,Event == 'Speciation')
+SVSP_duplication<-subset(SVSP_contrasts,Event == 'Duplication')
+
+
+wilcox.test(toxin_speciation$pic,toxin_duplication$pic,alternative = "less")
+wilcox.test(nontoxin_speciation$pic,nontoxin_duplication$pic,alternative = "less")
+wilcox.test(PLA2_speciation$pic,PLA2_duplication$pic,alternative = "less")
+wilcox.test(SVMP_speciation$pic,SVMP_duplication$pic,alternative = "less")
+wilcox.test(SVSP_speciation$pic,SVSP_duplication$pic,alternative = "less")
+
+make_contrast_plot = function( nodes_contrast, y_lim, colors_list ){
+  binwidth = 0.001
+		
+		D = 
+			nodes_contrast %>% 
+			group_by(Event) %>% 
+			# calculate densities for each group over same range; store in list column
+			summarise(d = list(density(pic, from = 0, to = 2))) %>% 
+			# make a new data.frame from two density objects
+			do(data.frame(x = .$d[[1]]$x,    # grab one set of x values (which are the same)
+										y = .$d[[1]]$y - .$d[[2]]$y))    # and subtract the y values
+		
+		D$Event[ D$y >= 0 ] = "Speciation"
+		D$Event[ D$y <= 0 ] = "Duplication"
+		D$Event = factor( D$Event, levels=c( "Speciation", "Duplication" ) )
+			
+		ggcontrasts = D %>%
+			ggplot(aes(x, y)) +    # now plot
+				geom_line() +
+				xlab( "clr(TPM) Phylogenetic Contrast" ) +
+				ylab( "Density Difference" ) +
+				xlim( 0, 2) + 
+				ylim( -y_lim, y_lim ) +
+				geom_area( aes( fill=Event ) ) +
+				geom_hline( yintercept = 0 ) +
+				theme_classic() +
+				theme(legend.position="none")+
+		    scale_fill_manual(values = colors_list)
+		
+		
+		ggcontrasts
+	}
+
+
+
+
+p1<-make_contrast_plot(toxin_contrasts, 1.5, c("green","grey")) +
+     geom_text(aes(x=1,y=1,label=c("Toxins \n p-value = 0.99")),size=5)
+p2<-make_contrast_plot(nontoxin_contrasts, 1.5, c("black","grey"))+
+     geom_text(aes(x=1,y=1,label=c("Nontoxins \n p-value = 1")),size=5)
+p3<-make_contrast_plot(PLA2_contrasts, 2.5, c("grey","red"))+
+     geom_text(aes(x=1,y=1,label=c("PLA2 \n n=41 \n p-value = 0.99")),size=5)
+p4<-make_contrast_plot(SVMP_contrasts, 1.5, c("grey","blue"))+
+     geom_text(aes(x=1,y=1,label=c("SVMP \n n=90 \n p-value = 0.87")),size=5)
+p5<-make_contrast_plot(SVSP_contrasts, 1.5, c("grey","yellow"))+
+     geom_text(aes(x=1,y=1,label=c("SVSP \n n=129 \n p-value = 0.99")),size=5)
+
+  
+(p1 | p2) /
+(p3 | p4) /
+(p5 |  plot_spacer() )
+
+
+  
+```
+
+
+
+
+
+First, pic's over time, colored by Toxin_Class
+```{r}
+library("ggplot2")
+
+
+ggplot(generax_prank_nodes_contrast) + geom_point(aes(x=node_age, y=pic, col=Toxin_Class)) +
+   geom_point(data=subset(generax_prank_nodes_contrast, Toxin_Class != 'Nontoxin'),
+              aes(x=node_age, y=pic, col=Toxin_Class)) + xlim(0,80) + ylim(0,10)
+
+
+
+ggplot(generax_prank_nodes_contrast) + geom_point(data=subset(generax_prank_nodes_contrast, Toxin_Class == 'Nontoxin'), aes(x=node_age, y=pic, col="gray",shape=Event)) +
+   geom_point(data=subset(generax_prank_nodes_contrast, Toxin_Class == 'CTL'),
+              aes(x=node_age, y=pic, col='green',shape=Event)) + xlim(0,80) + ylim(0,10)+ scale_color_manual(values=c("gray","green"))
+
+```
+
+
+
+
+
+
+Make Plots with expression at the terminal
+```{r}
+library(patchwork) #devtools::install_github("thomasp85/patchwork")
+library(ggtree)
+
+colors=c("turquoise1","royalblue1","yellow","lightgoldenrod","green","purple1","orchid1","skyblue1","red","darkorange","seagreen1")
+
+tip_shapes=c(Bothri_species$tip.label,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA)
+
+p1<-ggtree(Bothri_species, size = 1)  + #coord_cartesian(clip = 'off') + 
+  geom_tiplab(offset = 0.6, size = 4) +
+  geom_tippoint(aes(color=tip_shapes),show.legend = FALSE,size=4)+
+  theme_tree2() + scale_colour_manual(values=colors) 
+
+p1<-revts(p1) + scale_x_continuous(labels=abs) + xlim(-20, 6)
+
+tree <- ggtree(calibrated_generax_prank_TPM[[3]]@phylo) + 
+  geom_tippoint(aes(color=calibrated_generax_prank_TPM[[3]]@data$S),name = "species", show.legend = FALSE) +
+  geom_nodepoint(aes(shape=calibrated_generax_prank_TPM[[3]]@data$Event),color="gray45",size = 2, show.legend = FALSE ) +
+  theme_tree2() + scale_colour_manual(values=colors)
+
+
+bar_data<-data.frame(calibrated_generax_prank_TPM[[3]]@data$clade_label,calibrated_generax_prank_TPM[[3]]@data$Ave_clrTPM)
+colnames(bar_data) = c("id","clrTPM")
+bar_data<-na.omit(bar_data)
+
+p2<-facet_plot(tree + xlim_tree(53), "PLA2_Expression", data = bar_data, geom = ggstance::geom_barh, mapping = aes(x=clrTPM), stat = "identity",color = "red", fill="red" , width = 0.6)
+
+
+tree <- ggtree(calibrated_generax_prank_TPM[[2]]@phylo) +
+  geom_tippoint(aes(color=calibrated_generax_prank_TPM[[2]]@data$S),name = "species",size=0.25, show.legend = FALSE) +
+  geom_nodepoint(aes(shape=calibrated_generax_prank_TPM[[2]]@data$Event),size = 1.5, show.legend = FALSE ) +
+  theme_tree2() + scale_colour_manual(values=colors)
+
+bar_data<-data.frame(calibrated_generax_prank_TPM[[2]]@data$clade_label,calibrated_generax_prank_TPM[[2]]@data$Ave_clrTPM)
+colnames(bar_data) = c("id","clrTPM")
+bar_data<-na.omit(bar_data)
+
+p3<-facet_plot(tree + xlim_tree(70),'SVMP Expression',data = bar_data, geom = ggstance::geom_barh, mapping = aes(x=clrTPM),
+           stat ="identity",color = "blue", fill="blue", width = 0.6)
+
+
+
+tree <- ggtree(calibrated_generax_prank_TPM[[1]]@phylo) + 
+  geom_tippoint(aes(color=calibrated_generax_prank_TPM[[1]]@data$S),name = "species",size=0.25, show.legend = FALSE) +
+  geom_nodepoint(aes(shape=calibrated_generax_prank_TPM[[1]]@data$Event),size = 1.5, show.legend = FALSE ) +
+  theme_tree2() + scale_colour_manual(values=colors)
+bar_data<-data.frame(calibrated_generax_prank_TPM[[1]]@data$clade_label,calibrated_generax_prank_TPM[[1]]@data$Ave_clrTPM)
+colnames(bar_data) = c("id","clrTPM")
+bar_data<-na.omit(bar_data)
+
+p4<-facet_plot(tree + xlim_tree(55),'SVSP Expression',data = bar_data, geom = ggstance::geom_barh, mapping = aes(x=clrTPM),
+           stat ="identity", color = "yellow", fill="yellow", width = 0.6)
+
+
+(p1 | p2) /
+(p3 | p4)
+
+
+
+```
+
+
+
+
